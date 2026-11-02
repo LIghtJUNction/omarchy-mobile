@@ -49,18 +49,7 @@ for path in "$ROOT" "$kernel" "$dtb" "$watchdog" "$key" "$mkbootimg" "$out"; do
 done
 [[ $(basename "$mkbootimg") == mkbootimg.py ]] || die '--mkbootimg must name AOSP mkbootimg.py'
 [[ ! -e $out/boot.img ]] || die "$out/boot.img already exists; choose a fresh output directory"
-python3 - "$key" <<'PY'
-import base64, pathlib, struct, sys
-data = pathlib.Path(sys.argv[1]).read_text().split()
-if len(data) < 2 or data[0] not in ('ssh-ed25519', 'ssh-rsa', 'ecdsa-sha2-nistp256'):
-    sys.exit('--ssh-key must be an OpenSSH PUBLIC key, never a private key')
-try:
-    raw = base64.b64decode(data[1], validate=True)
-    n, = struct.unpack('>I', raw[:4])
-    assert raw[4:4+n].decode() == data[0]
-except (ValueError, struct.error, AssertionError, UnicodeError):
-    sys.exit('invalid SSH public key')
-PY
+python3 -I "$ROOT/tools/ssh-public-key.py" "$key"
 
 mkdir -p "$out"
 docker run --rm --platform linux/arm64 \

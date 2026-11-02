@@ -64,10 +64,10 @@ Usage: [DEVICE=<codename>] omamobile <command>
 
   capture [name]   Save what the connected phone exposes (Android over adb, or fastboot)
                    into $REFERENCE_DIR/<name>
-  initramfs [--release]
+  initramfs [--release | --ram-probe] [--ssh-key FILE]
                    Build the M1 initramfs into $KERNEL_OUT. --release omits
                    the builder's SSH keys from distributable boot images
-  initramfs-config <dir>
+  initramfs-config [--ram-probe] <dir>
                    Write only the device's files for the shared init (storage-guard
                    allowlist, trigger, ...) into <dir>, to check what initramfs packs
   kernel           Build the mainline kernel ($KERNEL_DIR) with our config fragment
@@ -118,6 +118,22 @@ load_device() {
       die "$file:$n: not a KEY=value line"
     fi
   done < "$file"
+  if [[ ${1:-} == --ram-probe ]]; then
+    [[ $DEV_BOOT_METHOD == ram-only ]] || die "$file: --ram-probe requires BOOT_METHOD=ram-only"
+    for key in CODENAME SOC COMPATIBLE INITRAMFS_INIT PANEL_SIZE; do
+      p="DEV_$key"
+      [[ -n ${!p:-} ]] || die "$file: $key is missing"
+    done
+    [[ $DEV_CODENAME == "$DEVICE" ]] || die "$file: CODENAME=$DEV_CODENAME, expected $DEVICE"
+    [[ ${DEV_BOOT_IMAGES+x} && -z $DEV_BOOT_IMAGES && ${DEV_UFS_RW+x} && -z $DEV_UFS_RW ]] \
+      || die "$file: a RAM probe requires empty BOOT_IMAGES and UFS_RW"
+    [[ $DEV_INITRAMFS_INIT == /initramfs/init ]] || die "$file: a RAM probe requires the shared /initramfs/init"
+    [[ $DEV_COMPATIBLE =~ ^[a-z0-9][a-z0-9,._+-]*$ ]] || die "$file: invalid COMPATIBLE"
+    [[ $DEV_PANEL_SIZE =~ ^([1-9][0-9]{1,4})x([1-9][0-9]{1,4})$ ]] || die "$file: invalid PANEL_SIZE"
+    (( BASH_REMATCH[1] <= 8192 && BASH_REMATCH[2] <= 8192 && BASH_REMATCH[1] * BASH_REMATCH[2] <= 16777216 )) \
+      || die "$file: PANEL_SIZE exceeds the probe frame budget"
+    return
+  fi
   case $DEV_BOOT_METHOD in
     android-v4|qcom-abl) ;;
     *) die "$file: unsupported BOOT_METHOD=$DEV_BOOT_METHOD; this command supports android-v4 and qcom-abl" ;;
@@ -378,7 +394,7 @@ initramfs_config() {
   local etc=${1:-} rw
   # Every board-specific step in the init checks the board against COMPATIBLE
   local board_step=""
-  [[ -n ${DEV_SIMPLEFB_TRIG_CON:-}${DEV_BRINGUP_PROBE:-}${DEV_INITRAMFS_MODULES:-}${DEV_USB_SWITCH:-} ]] && board_step=1
+  [[ -n ${DEV_SIMPLEFB_TRIG_CON:-}${DEV_BRINGUP_PROBE:-}${DEV_INITRAMFS_MODULES:-}${DEV_USB_SWITCH:-} || $DEV_BOOT_METHOD == ram-only ]] && board_step=1
   if [[ -n $board_step ]]; then
     [[ -n ${DEV_COMPATIBLE:-} ]] || die "COMPATIBLE is missing"
   fi
@@ -445,28 +461,49 @@ initramfs_config() {
   # The storage guard's allowlist. Without this file the init leaves every
   # partition read-only.
   printf '%s\n' "${rw[*]}" > "$etc/omamobile-ufs-rw"
+  if [[ $DEV_BOOT_METHOD == ram-only ]]; then
+    : > "$etc/omamobile-ram-probe"
+  else
+    rm -f "$etc/omamobile-ram-probe"
+  fi
   if [[ -n $product ]]; then
     printf '%s\n' "$product" > "$etc/omamobile-usb-product"
   fi
 }
 
 cmd_initramfs_config() {
-  [[ -n ${1:-} ]] || die "usage: omamobile initramfs-config <dir>"
-  load_device
+  local mode=""
+  if [[ ${1:-} == --ram-probe ]]; then mode=$1; shift; fi
+  [[ $# == 1 && -n $1 ]] || die "usage: omamobile initramfs-config [--ram-probe] <dir>"
+  load_device "$mode"
   initramfs_config "$1"
   ls -l "$1"
 }
 
 cmd_initramfs() {
   local dl="$WORK/downloads/alpine" stage="$KERNEL_OUT/initramfs" ver=3.24.2
-  local release=0
-  case ${1:-} in
-    '') ;;
-    --release) release=1 ;;
-    *) die "initramfs: expected --release or no argument" ;;
-  esac
-  (($# <= 1)) || die "initramfs: expected --release or no argument"
-  load_device
+  local release=0 ram_probe=0 ssh_key="" mode="" extra=()
+  while (($#)); do
+    case $1 in
+      --release) release=1 ;;
+      --ram-probe) ram_probe=1; mode=--ram-probe ;;
+      --ssh-key) shift; [[ -n ${1:-} ]] || die "--ssh-key needs a public-key file"; ssh_key=$1 ;;
+      *) die "initramfs: expected --release, --ram-probe or --ssh-key FILE" ;;
+    esac
+    shift
+  done
+  if ((release)); then
+    ((ram_probe == 0)) && [[ -z $ssh_key ]] || die "a release cannot contain a RAM probe or builder SSH key"
+  fi
+  if ((ram_probe)); then
+    [[ -n $ssh_key ]] || die "a RAM probe needs an explicit --ssh-key PUBLIC_KEY"
+    umask 077
+    extra+=(busybox-static)
+  fi
+  load_device "$mode"
+  if [[ -n $ssh_key ]]; then
+    python3 -I "$ROOT/tools/ssh-public-key.py" "$ssh_key" || die "invalid SSH public key"
+  fi
   # A leading slash is repo-root relative, so devices share initramfs/init.
   # Anything else is relative to device/<codename>/.
   local init
@@ -493,9 +530,14 @@ cmd_initramfs() {
   local apk
   # e2fsprogs-extra: resize2fs and dumpe2fs, to grow a freshly flashed root
   # to the whole userdata partition on its first boot (init, boot_arch)
-  for apk in $(python3 -I "$ROOT/tools/alpine-fetch.py" "$ver" "$dl/apks" dropbear kexec-tools e2fsprogs e2fsprogs-extra); do
+  for apk in $(python3 -I "$ROOT/tools/alpine-fetch.py" "$ver" "$dl/apks" dropbear kexec-tools e2fsprogs e2fsprogs-extra "${extra[@]}"); do
     tar -xzf "$apk" -C "$stage" --exclude='.PKGINFO' --exclude='.SIGN.*' --exclude='.*.sh' 2>/dev/null || true
   done
+  if ((ram_probe)); then
+    [[ -x $stage/bin/busybox.static ]] || die "busybox-static is missing"
+    install -m 755 "$stage/bin/busybox.static" "$stage/bin/busybox"
+    rm "$stage/bin/busybox.static"
+  fi
   # INITRAMFS_I2C_TOOLS=1: i2cget and i2cset (and their libi2c) for a device
   # whose init talks to a chip before any driver runs; nothing else from
   # i2c-tools (its perl scripts can't run here)
@@ -585,7 +627,9 @@ cmd_initramfs() {
   local sysroot builtins reboot_src="$ROOT/packages/omamobile-device-cheetah/src/reboot-to.c"
   [[ -f $reboot_src ]] || die "missing $reboot_src"
   mkdir -p "$stage/usr/local/bin"
-  if [[ -f $ROOT/packages/$DEV_PACKAGE/src/omamobile-bootctl.c ]]; then
+  if ((ram_probe)); then
+    say "RAM probe: no devmem or board-specific reboot helpers"
+  elif [[ -f $ROOT/packages/$DEV_PACKAGE/src/omamobile-bootctl.c ]]; then
     [[ -n ${CLANG_DIR:-} && -d $CLANG_DIR ]] || die "no clang found: run tools/fetch-toolchain (or 'lineage-ref sync', or set CLANG_DIR)"
     sysroot=$(alpine_sysroot)
     builtins=$(find "$CLANG_DIR/lib/clang" -name 'libclang_rt.builtins-aarch64-android.a' | head -1)
@@ -622,6 +666,9 @@ cmd_initramfs() {
   if ((release)); then
     rm -f "$stage/etc/dropbear"/dropbear_*_host_key
     say "Release initramfs: no builder SSH keys"
+  elif [[ -n $ssh_key ]]; then
+    install -Dm600 "$ssh_key" "$stage/root/.ssh/authorized_keys"
+    chmod 700 "$stage/root/.ssh"
   else
     mkdir -p "$stage/root/.ssh"
     cat "$HOME"/.ssh/*.pub > "$stage/root/.ssh/authorized_keys"

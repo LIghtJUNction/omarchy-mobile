@@ -1,0 +1,138 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Exercise the shared RAM path without a phone, mount or reboot.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+python3 - <<'PY'
+import os
+import base64
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+
+source = Path('initramfs/init').read_text()
+def function(name):
+    start = source.index(name + '() {')
+    return source[start:source.index('\n}', start) + 2] + '\n'
+
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    repo = root/'repo'
+    for name in ('bin', 'tools', 'device/six'):
+        (repo/name).mkdir(parents=True, exist_ok=True)
+    shutil.copy('bin/omamobile', repo/'bin/omamobile')
+    shutil.copy('tools/ssh-public-key.py', repo/'tools/ssh-public-key.py')
+    (repo/'omamobile.conf').write_text('DEVICE="${DEVICE:-six}"\nSRC_DIR=/not-a-source-tree\n')
+    good = Path('device/alphalm/device.conf').read_text().replace('CODENAME=alphalm', 'CODENAME=six')
+    descriptor = repo/'device/six/device.conf'
+    descriptor.write_text(good)
+    stubs = root/'bin'; stubs.mkdir()
+    for name in ('adb', 'fastboot', 'docker', 'curl', 'wget', 'ssh', 'sudo', 'dd', 'mount'):
+        path = stubs/name
+        path.write_text(f'#!/bin/sh\necho transport >> "{root}/transports"\nexit 97\n')
+        path.chmod(0o755)
+    env = dict(os.environ, DEVICE='six', WORK=str(root/'work'), KERNEL_OUT=str(root/'kernel'),
+               PATH=str(stubs)+':'+os.environ['PATH'])
+    def om(*args, ok=True):
+        result = subprocess.run(['bin/omamobile', *map(str, args)], cwd=repo, env=env, capture_output=True)
+        assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
+        return result
+
+    etc = root/'etc'
+    om('initramfs-config', '--ram-probe', etc)
+    assert (etc/'omamobile-ram-probe').is_file()
+    assert (etc/'omamobile-compatible').read_text() == 'lge,alphalm\n'
+    assert not (etc/'omamobile-ufs-rw').read_text().strip()
+    for command in ('images', 'flash', 'push', 'initramfs'):
+        result = om(command, ok=False)
+        assert b'unsupported BOOT_METHOD=ram-only' in result.stderr
+    assert not (root/'transports').exists() and not (root/'work').exists()
+    print('ok - explicit RAM config works; normal build/write paths refuse before transports')
+
+    for before, after in (('BOOT_IMAGES=""', 'BOOT_IMAGES=boot'), ('UFS_RW=""', 'UFS_RW=userdata'),
+                          ('BOOT_IMAGES=""', ''), ('INITRAMFS_INIT=/initramfs/init', 'INITRAMFS_INIT=private/init'),
+                          ('COMPATIBLE="lge,alphalm"', 'COMPATIBLE=../board'),
+                          ('PANEL_SIZE=1440x3120', 'PANEL_SIZE=99999x99999'),
+                          ('BOOT_METHOD=ram-only', 'BOOT_METHOD=qcom-abl')):
+        assert before in good
+        descriptor.write_text(good.replace(before, after))
+        om('initramfs-config', '--ram-probe', root/'bad', ok=False)
+        assert not (root/'bad').exists()
+    descriptor.write_text(good)
+    key = root/'key'
+    subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'ram-probe-test', '-f', str(key)], check=True)
+    subprocess.run(['python3', '-I', 'tools/ssh-public-key.py', str(key)+'.pub'], check=True)
+    for kind in ('rsa', 'ecdsa'):
+        extra = root/kind
+        subprocess.run(['ssh-keygen', '-q', '-t', kind, '-N', '', '-C', 'ram-probe-test', '-f', str(extra)], check=True)
+        subprocess.run(['python3', '-I', 'tools/ssh-public-key.py', str(extra)+'.pub'], check=True)
+    public = Path(str(key)+'.pub').read_text().split()
+    (root/'unicode.pub').write_text(' '.join(public[:2])+' test-\u6d4b\u8bd5\n')
+    subprocess.run(['python3', '-I', 'tools/ssh-public-key.py', str(root/'unicode.pub')], check=True)
+    wire = base64.b64decode(public[1])
+    for body in (wire[:-1], wire+b'X'):
+        (root/'bad.pub').write_text(public[0]+' '+base64.b64encode(body).decode()+'\n')
+        result = subprocess.run(['python3', '-I', 'tools/ssh-public-key.py', str(root/'bad.pub')], capture_output=True)
+        assert result.returncode != 0
+    om('initramfs', '--ram-probe', '--ssh-key', key, ok=False)
+    om('initramfs', '--ram-probe', ok=False)
+    om('initramfs', '--ram-probe', '--release', '--ssh-key', str(key)+'.pub', ok=False)
+    assert not (root/'transports').exists() and not (root/'work').exists()
+    print('ok - malformed keys and unsafe descriptors are refused; private keys and release probes cannot reach downloads')
+
+    for name in ('run', 'dt'):
+        (root/name).mkdir()
+    script = function('board_matches') + function('ram_probe_arm')
+    for old, new in (('/etc/', str(etc)+'/'), ('/proc/device-tree/', str(root/'dt')+'/'),
+                     ('/run/', str(root/'run')+'/'), ('/dev/kmsg', str(root/'kmsg')),
+                     ('/proc/sysrq-trigger', str(root/'sysrq'))):
+        script = script.replace(old, new)
+    prelude = f'''say() {{ echo "$*" >> '{root}/said'; }}
+sleep() {{ if [ "$1" = 90 ]; then echo 90 >> '{root}/deadline'; else command sleep 0.01; fi; }}
+reboot() {{ echo "$*" >> '{root}/reboot'; exit 0; }}
+RAM_PROBE=0
+'''
+    tail = f'''ram_probe_arm
+echo MODE=$RAM_PROBE
+if [ -f '{root}/run/omamobile-ram-guardian.pid' ]; then
+  wait "$(cat '{root}/run/omamobile-ram-guardian.pid')"
+fi
+echo AFTER_GUARD
+'''
+    for marker, compatible in ((False, b'lge,alphalm\0qcom,sm8150\0'),
+                                (True, b'lge,alphalm\0qcom,sm8150\0'),
+                                (True, b'google,other\0')):
+        for name in ('reboot', 'deadline', 'run/omamobile-ram-guardian.pid'):
+            (root/name).unlink(missing_ok=True)
+        (root/'dt/compatible').write_bytes(compatible)
+        (etc/'omamobile-ram-probe').unlink(missing_ok=True)
+        if marker:
+            (etc/'omamobile-ram-probe').touch()
+        process = subprocess.Popen(['sh', '-c', prelude+script+tail], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        blocked = False
+        try:
+            stdout, stderr = process.communicate(timeout=0.4)
+        except subprocess.TimeoutExpired:
+            blocked = True
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        assert not stderr, stderr
+        assert blocked == (marker and compatible.startswith(b'google,'))
+        assert (b'AFTER_GUARD' not in stdout) == blocked
+        if marker:
+            assert (root/'deadline').read_text() == '90\n'
+            assert (root/'reboot').read_text() == '-f\n'
+        else:
+            assert b'MODE=0' in stdout and not (root/'reboot').exists()
+
+    start = source.index('if [ "$RAM_PROBE" = 1 ]; then', source.index('say "ready"'))
+    end = source.index('\n# Self-recovery', start)
+    for probe in (0, 1):
+        result = subprocess.run(['sh', '-c', f'RAM_PROBE={probe}\nsay() {{ :; }}\nsleep() {{ exit 0; }}\n'+source[start:end]+'\necho ROOT_PATH_REACHED\n'], capture_output=True, check=True)
+        assert (b'ROOT_PATH_REACHED' not in result.stdout) == bool(probe)
+    assert source.index('\nram_probe_arm\n') < source.index('\nload_modules\n')
+    print('ok - recovery is armed, a wrong board stops, and probe mode never enters the root path')
+PY
