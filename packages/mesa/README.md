@@ -92,6 +92,12 @@ contains them; do not mistake a model string for working architecture support.
 
 ## Building on the phone
 
+The 1.5 candidate also enables Gallium Freedreno for Qualcomm Adreno.
+The LG G8 integration needs this: the earlier driver list contained only
+Panfrost and software renderers. This flag is preparation for the port;
+the candidate has not yet been built or exercised on the LG G8, and no
+hardware-acceleration acceptance is implied. Vulkan remains PanVK-only.
+
 As a normal user in the Arch root, with internet:
 
 ```sh
@@ -99,9 +105,9 @@ sudo pacman -S --needed base-devel
 gpg --recv-keys 57551DE15B968F6341C248F68D8E31AFC32428A6   # Eric Engestrom, signed 26.2.4
 cd packages/mesa
 makepkg -s                       # pulls the makedepends listed in the PKGBUILD
-sudo pacman -U mesa-1:26.2.4-1.4-aarch64.pkg.tar.zst \
-  vulkan-panfrost-1:26.2.4-1.4-aarch64.pkg.tar.zst \
-  vulkan-mesa-implicit-layers-1:26.2.4-1.4-aarch64.pkg.tar.zst
+sudo pacman -U mesa-1:26.2.4-1.5-aarch64.pkg.tar.zst \
+  vulkan-panfrost-1:26.2.4-1.5-aarch64.pkg.tar.zst \
+  vulkan-mesa-implicit-layers-1:26.2.4-1.5-aarch64.pkg.tar.zst
 ```
 
 Until Panthor exposes `/dev/dri/renderD128`, nothing changes visibly:

@@ -135,3 +135,36 @@ belong in the kernel repository. Run the project's local checks and a
 real-device smoke test before submitting the port; publish no firmware,
 NV, complete captures or identifiers. Update the device matrix only from
 the acceptance evidence and link the corresponding notes.
+
+## Resume after the 2026-11-02 checkpoint
+
+The owner requested stopping after committing and pushing this work.
+Kernel M1 is cd217a95a on lgg8/modem-20261102; shared-initramfs support
+is c489eca on this branch. The phone has returned to Android, the
+successful result is retained, and no test network namespace remains.
+
+Continue with a device package named omamobile-device-alphalm and add its
+PACKAGE field to the descriptor; no such package has been created yet.
+Use a read-only root supplied over the existing USB link and a RAM overlay
+for the next Arch/Hyprland gate. The verified kernel has NBD and overlayfs
+as modules, ext4 built in, and SCSI disabled. Pack matching modules and the
+reviewed private GPU firmware; keep the accepted Image and DTB unchanged.
+Do not turn the M1 RAM loop into the normal userdata/install path.
+
+Mesa 1.5 adds Gallium Freedreno in source only; package compilation and
+GPU execution remain unverified. No rootfs image exists yet. Published
+packages fetched into out/alphalm/published verified their signatures,
+but download stopped twice on TLS EOF errors, most recently while fetching
+omamobile-modem-sit-0.3.4-1-aarch64.pkg.tar.zst. Re-running
+tools/fetch-published --channel development out/alphalm/published reuses
+already verified files. A port-local signing key is in gitignored
+keys/alphalm; retain it privately and use the project's --local alphalm
+builds. Do not publish the key, phone firmware, NV or private boot images.
+
+After Arch/Hyprland, complete actual GPU/display/touch, Wi-Fi scan and
+association/address provisioning, Bluetooth pairing/data/wake, audio,
+sensors/cameras and the other peripherals, power/charging/long-term
+stability, real UFS protection and finally the separately designed
+persistent boot path. Physical SIM testing remains deferred by the owner.
+These gates remain open; no upstream submission or complete-device claim
+has been made.
